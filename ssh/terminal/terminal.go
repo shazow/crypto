@@ -7,6 +7,7 @@ package terminal
 import (
 	"bytes"
 	"io"
+	"strconv"
 	"sync"
 	"unicode/utf8"
 )
@@ -92,6 +93,11 @@ type Terminal struct {
 	// the incomplete, initial line. That value is stored in
 	// historyPending.
 	historyPending string
+
+	// enterClear will clear the input line on enter, instead of printing a
+	// new line after the input. It's useful for replacing the input with
+	// something else without echoing it.
+	enterClear bool
 }
 
 // NewTerminal runs a VT100 terminal on the given ReadWriter. If the ReadWriter is
@@ -271,38 +277,53 @@ func (t *Terminal) moveCursorToPos(pos int) {
 }
 
 func (t *Terminal) move(up, down, left, right int) {
-	movement := make([]rune, 3*(up+down+left+right))
-	m := movement
-	for i := 0; i < up; i++ {
-		m[0] = keyEscape
-		m[1] = '['
-		m[2] = 'A'
-		m = m[3:]
-	}
-	for i := 0; i < down; i++ {
-		m[0] = keyEscape
-		m[1] = '['
-		m[2] = 'B'
-		m = m[3:]
-	}
-	for i := 0; i < left; i++ {
-		m[0] = keyEscape
-		m[1] = '['
-		m[2] = 'D'
-		m = m[3:]
-	}
-	for i := 0; i < right; i++ {
-		m[0] = keyEscape
-		m[1] = '['
-		m[2] = 'C'
-		m = m[3:]
+	m := []rune{}
+
+	// 1 unit up can be expressed as ^[A
+	// 5 units up can be expressed as ^[[5A
+
+	if up == 1 {
+		m = append(m, keyEscape, '[', 'A')
+	} else if up > 1 {
+		m = append(m, keyEscape, '[')
+		m = append(m, []rune(strconv.Itoa(up))...)
+		m = append(m, 'A')
 	}
 
-	t.queue(movement)
+	if down == 1 {
+		m = append(m, keyEscape, '[', 'B')
+	} else if down > 1 {
+		m = append(m, keyEscape, '[')
+		m = append(m, []rune(strconv.Itoa(down))...)
+		m = append(m, 'B')
+	}
+
+	if right == 1 {
+		m = append(m, keyEscape, '[', 'C')
+	} else if right > 1 {
+		m = append(m, keyEscape, '[')
+		m = append(m, []rune(strconv.Itoa(right))...)
+		m = append(m, 'C')
+	}
+
+	if left == 1 {
+		m = append(m, keyEscape, '[', 'D')
+	} else if left > 1 {
+		m = append(m, keyEscape, '[')
+		m = append(m, []rune(strconv.Itoa(left))...)
+		m = append(m, 'D')
+	}
+
+	t.queue(m)
 }
 
 func (t *Terminal) clearLineToRight() {
 	op := []rune{keyEscape, '[', 'K'}
+	t.queue(op)
+}
+
+func (t *Terminal) clearScreenBelow() {
+	op := []rune{keyEscape, '[', 'J'}
 	t.queue(op)
 }
 
@@ -506,14 +527,24 @@ func (t *Terminal) handleKey(key rune) (line string, ok bool) {
 			}
 		}
 	case keyEnter:
-		t.moveCursorToPos(len(t.line))
-		t.queue([]rune("\r\n"))
 		line = string(t.line)
+		if t.enterClear {
+			// Clear line on enter instead of starting a new line. The old
+			// prompt is retained.
+			t.moveCursorToPos(0)
+			t.clearLineToRight()
+			t.clearScreenBelow() // Necessary for wrapped lines
+		} else {
+			// Pushing the line up resets the cursor to 0,0 and we render a
+			// fresh prompt.
+			t.moveCursorToPos(len(t.line))
+			t.queue([]rune("\r\n"))
+			t.cursorX = 0
+			t.cursorY = 0
+		}
 		ok = true
 		t.line = t.line[:0]
 		t.pos = 0
-		t.cursorX = 0
-		t.cursorY = 0
 		t.maxLine = 0
 	case keyDeleteWord:
 		// Delete zero or more spaces and then one or more characters.
@@ -858,6 +889,15 @@ func (t *Terminal) SetSize(width, height int) error {
 	_, err := t.c.Write(t.outBuf)
 	t.outBuf = t.outBuf[:0]
 	return err
+}
+
+// SetEnterClear sets whether the input line should be cleared or echoed on
+// enter.
+func (t *Terminal) SetEnterClear(on bool) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	t.enterClear = on
 }
 
 type pasteIndicatorError struct{}
